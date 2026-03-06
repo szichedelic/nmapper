@@ -26,8 +26,70 @@ pub async fn scan_ports(
     }
 }
 
+/// Block the kernel from sending RST packets that interfere with SYN scanning.
+/// On macOS, the kernel sees incoming SYN-ACKs for connections it didn't initiate
+/// and immediately sends RSTs, killing our half-open probes before we can read them.
+/// Returns true if the rule was installed successfully.
+fn install_pf_rst_block(target: Ipv4Addr, verbose: bool) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+
+    let rule = format!(
+        "block drop out proto tcp from any to {target} flags R/R\n"
+    );
+
+    let rule_path = "/tmp/nmapper_pf_rst.conf";
+    if std::fs::write(rule_path, &rule).is_err() {
+        return false;
+    }
+
+    let status = std::process::Command::new("pfctl")
+        .args(["-a", "nmapper", "-f", rule_path])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    if status.is_err() || !status.unwrap().success() {
+        if verbose {
+            eprintln!("  [!] Failed to install pf RST block rule");
+        }
+        return false;
+    }
+
+    let _ = std::process::Command::new("pfctl")
+        .args(["-e"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    if verbose {
+        eprintln!("  [*] Installed pf rule to block kernel RSTs");
+    }
+
+    true
+}
+
+/// Remove the pf RST block rule.
+fn remove_pf_rst_block(verbose: bool) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+
+    let _ = std::process::Command::new("pfctl")
+        .args(["-a", "nmapper", "-F", "all"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let _ = std::fs::remove_file("/tmp/nmapper_pf_rst.conf");
+
+    if verbose {
+        eprintln!("  [*] Removed pf RST block rule");
+    }
+}
+
 /// TCP SYN (half-open) scan using batch send-then-receive pattern.
-/// Sends all SYN packets first, then collects responses.
 async fn syn_scan(
     target: IpAddr,
     ports: &[u16],
@@ -58,6 +120,27 @@ async fn syn_scan(
         }
     };
 
+    // Block kernel RSTs so they don't kill our half-open probes
+    let pf_installed = install_pf_rst_block(target_v4, verbose);
+
+    let results = syn_scan_inner(&mut tx, &mut rx, target, target_v4, ports, timing, verbose);
+
+    if pf_installed {
+        remove_pf_rst_block(verbose);
+    }
+
+    results
+}
+
+fn syn_scan_inner(
+    tx: &mut transport::TransportSender,
+    rx: &mut transport::TransportReceiver,
+    target: IpAddr,
+    target_v4: Ipv4Addr,
+    ports: &[u16],
+    timing: &TimingConfig,
+    verbose: bool,
+) -> Vec<PortResult> {
     let mut rng = rand::thread_rng();
 
     // src port → dst port map for correlating responses to probes
@@ -68,7 +151,6 @@ async fn syn_scan(
         results_map.insert(port, PortState::Filtered);
     }
 
-    // Phase 1: Send all SYN packets in rapid succession
     let delay = Duration::from_millis(timing.delay_ms);
     for &port in ports {
         let src_port: u16 = rng.gen_range(49152..65535);
@@ -100,10 +182,9 @@ async fn syn_scan(
         }
     }
 
-    // Phase 2: Collect responses
     let receive_timeout = Duration::from_millis(timing.timeout_ms);
     let start = std::time::Instant::now();
-    let mut iter = transport::tcp_packet_iter(&mut rx);
+    let mut iter = transport::tcp_packet_iter(rx);
     let mut responded = 0;
 
     while start.elapsed() < receive_timeout && responded < ports.len() {
@@ -117,9 +198,8 @@ async fn syn_scan(
                 if let Some(&target_port) = port_map.get(&dst_port) {
                     let flags = packet.get_flags();
                     let state = if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
-                        // Send RST to close the half-open connection
                         send_rst(
-                            &mut tx,
+                            tx,
                             target_v4,
                             dst_port,
                             packet.get_source(),
@@ -144,7 +224,6 @@ async fn syn_scan(
         }
     }
 
-    // Build sorted results
     let mut results: Vec<PortResult> = ports
         .iter()
         .map(|&port| PortResult {

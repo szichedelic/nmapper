@@ -1,11 +1,14 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
+use pnet::datalink::{self, Channel::Ethernet, MacAddr};
+use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::tcp::{MutableTcpPacket, TcpFlags};
-use pnet::transport::{self, TransportChannelType, TransportProtocol};
+use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
+use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
+use pnet::packet::Packet;
 use rand::Rng;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
@@ -26,70 +29,123 @@ pub async fn scan_ports(
     }
 }
 
-/// Block the kernel from sending RST packets that interfere with SYN scanning.
-/// On macOS, the kernel sees incoming SYN-ACKs for connections it didn't initiate
-/// and immediately sends RSTs, killing our half-open probes before we can read them.
-/// Returns true if the rule was installed successfully.
-fn install_pf_rst_block(target: Ipv4Addr, verbose: bool) -> bool {
-    if !cfg!(target_os = "macos") {
-        return false;
+/// Determine the local source IP the OS would use to reach the target.
+fn get_source_ip(target: Ipv4Addr) -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect((target, 80)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) => Some(v4),
+        _ => None,
     }
+}
 
-    let rule = format!(
-        "block drop out proto tcp from any to {target} flags R/R\n"
-    );
+/// Resolve the gateway MAC address by sending an ARP request via the datalink channel.
+fn resolve_gateway_mac(
+    interface: &datalink::NetworkInterface,
+    src_mac: MacAddr,
+    src_ip: Ipv4Addr,
+    target: Ipv4Addr,
+) -> Option<MacAddr> {
+    let config = datalink::Config {
+        read_timeout: Some(Duration::from_millis(500)),
+        ..Default::default()
+    };
 
-    let rule_path = "/tmp/nmapper_pf_rst.conf";
-    if std::fs::write(rule_path, &rule).is_err() {
-        return false;
-    }
+    let (mut tx, mut rx) = match datalink::channel(interface, config) {
+        Ok(Ethernet(tx, rx)) => (tx, rx),
+        _ => return None,
+    };
 
-    let status = std::process::Command::new("pfctl")
-        .args(["-a", "nmapper", "-f", rule_path])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // Build ARP request: 14 (eth) + 28 (arp) = 42 bytes
+    let mut buf = [0u8; 42];
 
-    if status.is_err() || !status.unwrap().success() {
-        if verbose {
-            eprintln!("  [!] Failed to install pf RST block rule");
+    // Ethernet header
+    buf[0..6].copy_from_slice(&[0xff; 6]); // broadcast dest
+    buf[6..12].copy_from_slice(&src_mac.octets());
+    buf[12..14].copy_from_slice(&[0x08, 0x06]); // ARP ethertype
+
+    // ARP payload
+    buf[14..16].copy_from_slice(&[0x00, 0x01]); // hardware type: Ethernet
+    buf[16..18].copy_from_slice(&[0x08, 0x00]); // protocol type: IPv4
+    buf[18] = 6; // hardware addr len
+    buf[19] = 4; // protocol addr len
+    buf[20..22].copy_from_slice(&[0x00, 0x01]); // operation: request
+    buf[22..28].copy_from_slice(&src_mac.octets()); // sender MAC
+    buf[28..32].copy_from_slice(&src_ip.octets()); // sender IP
+    buf[32..38].copy_from_slice(&[0x00; 6]); // target MAC (unknown)
+    buf[38..42].copy_from_slice(&target.octets()); // target IP
+
+    tx.send_to(&buf, None);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match rx.next() {
+            Ok(frame) => {
+                if frame.len() < 42 {
+                    continue;
+                }
+                // Check it's an ARP reply (ethertype 0x0806, operation 0x0002)
+                if frame[12..14] != [0x08, 0x06] || frame[20..22] != [0x00, 0x02] {
+                    continue;
+                }
+                // Check sender IP matches our target
+                if frame[28..32] == target.octets() {
+                    let mac = MacAddr::new(
+                        frame[22], frame[23], frame[24], frame[25], frame[26], frame[27],
+                    );
+                    return Some(mac);
+                }
+            }
+            Err(_) => continue,
         }
-        return false;
     }
 
-    let _ = std::process::Command::new("pfctl")
-        .args(["-e"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    if verbose {
-        eprintln!("  [*] Installed pf rule to block kernel RSTs");
-    }
-
-    true
+    None
 }
 
-/// Remove the pf RST block rule.
-fn remove_pf_rst_block(verbose: bool) {
-    if !cfg!(target_os = "macos") {
-        return;
+/// Get the default gateway IP from the routing table.
+fn get_default_gateway() -> Option<Ipv4Addr> {
+    let output = std::process::Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("gateway:") {
+            let gw = trimmed.strip_prefix("gateway:")?.trim();
+            return gw.parse().ok();
+        }
     }
-
-    let _ = std::process::Command::new("pfctl")
-        .args(["-a", "nmapper", "-F", "all"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    let _ = std::fs::remove_file("/tmp/nmapper_pf_rst.conf");
-
-    if verbose {
-        eprintln!("  [*] Removed pf RST block rule");
-    }
+    None
 }
 
-/// TCP SYN (half-open) scan using batch send-then-receive pattern.
+/// Determine whether target is on the local subnet (ARP directly) or remote (ARP the gateway).
+fn get_next_hop_ip(
+    interface: &datalink::NetworkInterface,
+    target: Ipv4Addr,
+) -> Ipv4Addr {
+    for ip_net in &interface.ips {
+        if let IpAddr::V4(v4) = ip_net.ip() {
+            let prefix = ip_net.prefix();
+            let mask = if prefix == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - prefix)
+            };
+            let net_addr = u32::from(v4) & mask;
+            let target_net = u32::from(target) & mask;
+            if net_addr == target_net {
+                return target; // On same subnet, ARP the target directly
+            }
+        }
+    }
+    get_default_gateway().unwrap_or(target)
+}
+
+/// TCP SYN (half-open) scan using BPF datalink channel.
+/// On macOS, raw TCP sockets cannot receive incoming packets, so we use BPF
+/// to send and receive raw Ethernet frames containing our TCP SYN probes.
 async fn syn_scan(
     target: IpAddr,
     ports: &[u16],
@@ -106,107 +162,209 @@ async fn syn_scan(
         }
     };
 
-    let protocol =
-        TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Tcp));
-
-    let (mut tx, mut rx) = match transport::transport_channel(65536, protocol) {
-        Ok((tx, rx)) => (tx, rx),
-        Err(e) => {
+    let src_ip = match get_source_ip(target_v4) {
+        Some(ip) => ip,
+        None => {
             if verbose {
-                eprintln!("  [!] Failed to create raw socket: {e} (need root?)");
-                eprintln!("  [!] Falling back to TCP connect scan");
+                eprintln!("  [!] Cannot determine source IP, falling back to connect scan");
             }
             return connect_scan(target, ports, timing, verbose).await;
         }
     };
 
-    // Block kernel RSTs so they don't kill our half-open probes
-    let pf_installed = install_pf_rst_block(target_v4, verbose);
+    let interfaces = datalink::interfaces();
+    let interface = match interfaces
+        .into_iter()
+        .find(|iface| {
+            iface.is_up()
+                && !iface.is_loopback()
+                && iface
+                    .ips
+                    .iter()
+                    .any(|ip| ip.ip() == IpAddr::V4(src_ip))
+        }) {
+        Some(iface) => iface,
+        None => {
+            if verbose {
+                eprintln!("  [!] No suitable interface found, falling back to connect scan");
+            }
+            return connect_scan(target, ports, timing, verbose).await;
+        }
+    };
 
-    let results = syn_scan_inner(&mut tx, &mut rx, target, target_v4, ports, timing, verbose);
+    let src_mac = match interface.mac {
+        Some(mac) if mac != MacAddr::zero() => mac,
+        _ => {
+            if verbose {
+                eprintln!("  [!] No MAC address on interface, falling back to connect scan");
+            }
+            return connect_scan(target, ports, timing, verbose).await;
+        }
+    };
 
-    if pf_installed {
-        remove_pf_rst_block(verbose);
+    let next_hop = get_next_hop_ip(&interface, target_v4);
+    let dst_mac = match resolve_gateway_mac(&interface, src_mac, src_ip, next_hop) {
+        Some(mac) => mac,
+        None => {
+            if verbose {
+                eprintln!("  [!] Cannot resolve MAC for {next_hop}, falling back to connect scan");
+            }
+            return connect_scan(target, ports, timing, verbose).await;
+        }
+    };
+
+    if verbose {
+        eprintln!(
+            "  [*] SYN scan via {} (src={src_ip}, dst_mac={dst_mac})",
+            interface.name
+        );
     }
 
-    results
+    let config = datalink::Config {
+        read_timeout: Some(Duration::from_millis(100)),
+        ..Default::default()
+    };
+
+    let (mut tx, mut rx) = match datalink::channel(&interface, config) {
+        Ok(Ethernet(tx, rx)) => (tx, rx),
+        _ => {
+            if verbose {
+                eprintln!("  [!] Failed to open datalink channel, falling back to connect scan");
+            }
+            return connect_scan(target, ports, timing, verbose).await;
+        }
+    };
+
+    syn_scan_bpf(
+        &mut tx, &mut rx, src_ip, src_mac, target_v4, dst_mac, ports, timing, verbose,
+    )
 }
 
-fn syn_scan_inner(
-    tx: &mut transport::TransportSender,
-    rx: &mut transport::TransportReceiver,
-    target: IpAddr,
+#[allow(clippy::too_many_arguments)]
+fn syn_scan_bpf(
+    tx: &mut Box<dyn datalink::DataLinkSender>,
+    rx: &mut Box<dyn datalink::DataLinkReceiver>,
+    src_ip: Ipv4Addr,
+    src_mac: MacAddr,
     target_v4: Ipv4Addr,
+    dst_mac: MacAddr,
     ports: &[u16],
     timing: &TimingConfig,
     verbose: bool,
 ) -> Vec<PortResult> {
     let mut rng = rand::thread_rng();
 
-    // src port → dst port map for correlating responses to probes
     let mut port_map: HashMap<u16, u16> = HashMap::new();
-    // All ports start as Filtered; updated when responses arrive
     let mut results_map: HashMap<u16, PortState> = HashMap::new();
     for &port in ports {
         results_map.insert(port, PortState::Filtered);
     }
 
+    // Send phase: blast SYN packets as raw Ethernet frames
     let delay = Duration::from_millis(timing.delay_ms);
+    let mut ip_id: u16 = rng.gen();
+
     for &port in ports {
         let src_port: u16 = rng.gen_range(49152..65535);
         port_map.insert(src_port, port);
 
-        let mut tcp_buf = [0u8; 20];
-        if let Some(mut tcp_packet) = MutableTcpPacket::new(&mut tcp_buf) {
-            tcp_packet.set_source(src_port);
-            tcp_packet.set_destination(port);
-            tcp_packet.set_sequence(rng.gen());
-            tcp_packet.set_acknowledgement(0);
-            tcp_packet.set_data_offset(5);
-            tcp_packet.set_flags(TcpFlags::SYN);
-            tcp_packet.set_window(64240);
-            tcp_packet.set_urgent_ptr(0);
+        // 14 (eth) + 20 (ip) + 20 (tcp) = 54 bytes
+        let mut buf = [0u8; 54];
 
-            let checksum = pnet::packet::tcp::ipv4_checksum(
-                &tcp_packet.to_immutable(),
-                &Ipv4Addr::UNSPECIFIED,
+        // Ethernet header
+        {
+            let mut eth = MutableEthernetPacket::new(&mut buf[..14]).unwrap();
+            eth.set_destination(dst_mac);
+            eth.set_source(src_mac);
+            eth.set_ethertype(EtherTypes::Ipv4);
+        }
+
+        // IPv4 header
+        {
+            let mut ip = MutableIpv4Packet::new(&mut buf[14..34]).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length(40); // 20 IP + 20 TCP
+            ip.set_identification(ip_id);
+            ip_id = ip_id.wrapping_add(1);
+            ip.set_flags(0x02); // Don't Fragment
+            ip.set_ttl(64);
+            ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+            ip.set_source(src_ip);
+            ip.set_destination(target_v4);
+            let cksum = pnet::packet::ipv4::checksum(&ip.to_immutable());
+            ip.set_checksum(cksum);
+        }
+
+        // TCP header
+        {
+            let mut tcp = MutableTcpPacket::new(&mut buf[34..54]).unwrap();
+            tcp.set_source(src_port);
+            tcp.set_destination(port);
+            tcp.set_sequence(rng.gen());
+            tcp.set_acknowledgement(0);
+            tcp.set_data_offset(5);
+            tcp.set_flags(TcpFlags::SYN);
+            tcp.set_window(64240);
+            tcp.set_urgent_ptr(0);
+            let cksum = pnet::packet::tcp::ipv4_checksum(
+                &tcp.to_immutable(),
+                &src_ip,
                 &target_v4,
             );
-            tcp_packet.set_checksum(checksum);
-
-            let _ = tx.send_to(tcp_packet, IpAddr::V4(target_v4));
+            tcp.set_checksum(cksum);
         }
+
+        tx.send_to(&buf, None);
 
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
     }
 
+    // Receive phase: read raw Ethernet frames and parse TCP responses
     let receive_timeout = Duration::from_millis(timing.timeout_ms);
     let start = std::time::Instant::now();
-    let mut iter = transport::tcp_packet_iter(rx);
     let mut responded = 0;
 
     while start.elapsed() < receive_timeout && responded < ports.len() {
-        match iter.next_with_timeout(Duration::from_millis(100)) {
-            Ok(Some((packet, addr))) => {
-                if addr != IpAddr::V4(target_v4) {
+        match rx.next() {
+            Ok(frame) => {
+                let eth = match EthernetPacket::new(frame) {
+                    Some(e) => e,
+                    None => continue,
+                };
+
+                if eth.get_ethertype() != EtherTypes::Ipv4 {
                     continue;
                 }
 
-                let dst_port = packet.get_destination();
+                let ip = match Ipv4Packet::new(eth.payload()) {
+                    Some(i) => i,
+                    None => continue,
+                };
+
+                if ip.get_source() != target_v4 || ip.get_destination() != src_ip {
+                    continue;
+                }
+
+                if ip.get_next_level_protocol() != IpNextHeaderProtocols::Tcp {
+                    continue;
+                }
+
+                let ip_hdr_len = (ip.get_header_length() as usize) * 4;
+                let tcp_data = &eth.payload()[ip_hdr_len..];
+                let tcp = match TcpPacket::new(tcp_data) {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                let dst_port = tcp.get_destination();
                 if let Some(&target_port) = port_map.get(&dst_port) {
-                    let flags = packet.get_flags();
+                    let flags = tcp.get_flags();
                     let state = if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
-                        send_rst(
-                            tx,
-                            target_v4,
-                            dst_port,
-                            packet.get_source(),
-                            packet.get_acknowledgement(),
-                        );
                         if verbose {
-                            eprintln!("  [+] {target}:{target_port} - open (SYN-ACK)");
+                            eprintln!("  [+] {target_v4}:{target_port} - open (SYN-ACK)");
                         }
                         PortState::Open
                     } else if flags & TcpFlags::RST != 0 {
@@ -219,8 +377,12 @@ fn syn_scan_inner(
                     responded += 1;
                 }
             }
-            Ok(None) => continue,
-            Err(_) => break,
+            Err(_) => {
+                if start.elapsed() >= receive_timeout {
+                    break;
+                }
+                continue;
+            }
         }
     }
 
@@ -236,33 +398,6 @@ fn syn_scan_inner(
 
     results.sort_by_key(|r| r.port);
     results
-}
-
-fn send_rst(
-    tx: &mut transport::TransportSender,
-    target: Ipv4Addr,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-) {
-    let mut tcp_buf = [0u8; 20];
-    if let Some(mut tcp_packet) = MutableTcpPacket::new(&mut tcp_buf) {
-        tcp_packet.set_source(src_port);
-        tcp_packet.set_destination(dst_port);
-        tcp_packet.set_sequence(seq);
-        tcp_packet.set_data_offset(5);
-        tcp_packet.set_flags(TcpFlags::RST);
-        tcp_packet.set_window(0);
-
-        let checksum = pnet::packet::tcp::ipv4_checksum(
-            &tcp_packet.to_immutable(),
-            &Ipv4Addr::UNSPECIFIED,
-            &target,
-        );
-        tcp_packet.set_checksum(checksum);
-
-        let _ = tx.send_to(tcp_packet, IpAddr::V4(target));
-    }
 }
 
 /// TCP Connect scan — full three-way handshake using tokio.

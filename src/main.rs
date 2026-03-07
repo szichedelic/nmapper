@@ -234,6 +234,13 @@ async fn run_scan(
             None
         };
 
+        let traceroute_hops = if cli.traceroute {
+            eprintln!("{}", "  [*] Traceroute...".dimmed());
+            scanner::traceroute::traceroute(ip, cli.verbose)
+        } else {
+            Vec::new()
+        };
+
         let warnings = if cli.vuln_check {
             eprintln!("{}", "  [*] Vulnerability checks...".dimmed());
             vuln_check::check_vulnerabilities(ip, &port_results, cli.verbose)
@@ -253,6 +260,7 @@ async fn run_scan(
             status: HostStatus::Up,
             ports: port_results,
             os,
+            traceroute: traceroute_hops,
             warnings,
         });
     }
@@ -271,6 +279,7 @@ async fn run_scan(
                 status: result.status,
                 ports: Vec::new(),
                 os: None,
+                traceroute: Vec::new(),
                 warnings: Vec::new(),
             });
         }
@@ -499,7 +508,8 @@ async fn main() -> Result<()> {
 
     let needs_root = scan_type.is_raw()
         || matches!(discovery, DiscoveryMethod::Arp)
-        || cli.os_detect;
+        || cli.os_detect
+        || cli.traceroute;
 
     if needs_root && !is_root() {
         eprintln!(

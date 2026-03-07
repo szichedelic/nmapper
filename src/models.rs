@@ -39,6 +39,8 @@ pub struct HostResult {
     pub ports: Vec<PortResult>,
     pub os: Option<OsFingerprint>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub traceroute: Vec<TracerouteHop>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<crate::scanner::vuln_check::VulnWarning>,
 }
 
@@ -141,6 +143,14 @@ pub struct OsDetails {
     pub window_size: u16,
     pub df_bit: bool,
     pub tcp_options_order: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TracerouteHop {
+    pub ttl: u8,
+    pub ip: Option<IpAddr>,
+    pub hostname: Option<String>,
+    pub rtt_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

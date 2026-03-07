@@ -179,6 +179,23 @@ fn print_host(host: &HostResult) {
         }
     }
 
+    if !host.traceroute.is_empty() {
+        println!();
+        println!("  Traceroute:");
+        for hop in &host.traceroute {
+            let ip_str = hop
+                .ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "*".to_string());
+            let name = hop.hostname.as_deref().unwrap_or("");
+            let rtt = hop
+                .rtt_ms
+                .map(|r| format!("{r:.1}ms"))
+                .unwrap_or_else(|| "*".to_string());
+            println!("    {:>2}  {:<16} {:<30} {}", hop.ttl, ip_str, name, rtt);
+        }
+    }
+
     let closed_count = host
         .ports
         .iter()

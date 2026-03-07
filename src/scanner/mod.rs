@@ -7,4 +7,5 @@ pub mod port_scanner;
 pub mod ssdp;
 pub mod service_detect;
 pub mod tls_inspect;
+pub mod traceroute;
 pub mod vuln_check;

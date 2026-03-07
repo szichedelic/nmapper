@@ -95,6 +95,10 @@ pub struct Cli {
     #[arg(long = "interleave")]
     pub interleave: bool,
 
+    /// Perform traceroute to each host
+    #[arg(long = "traceroute")]
+    pub traceroute: bool,
+
     /// Increase verbosity
     #[arg(short, long)]
     pub verbose: bool,

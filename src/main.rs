@@ -248,6 +248,32 @@ async fn run_scan(
             Vec::new()
         };
 
+        let dns_enum = if cli.dns_enum {
+            let has_dns = port_results.iter().any(|p| p.port == 53 && p.state == PortState::Open);
+            if has_dns {
+                eprintln!("{}", "  [*] DNS enumeration...".dimmed());
+                let domain = hostname.as_deref();
+                let subnet = cli.targets.split('/').next().and_then(|ip_str| {
+                    let parts: Vec<&str> = ip_str.split('.').collect();
+                    if parts.len() == 4 {
+                        Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]))
+                    } else {
+                        None
+                    }
+                });
+                Some(scanner::dns_enum::dns_enumerate(
+                    ip,
+                    domain,
+                    subnet.as_deref(),
+                    cli.verbose,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mdns_names = mdns_map.get(&ip).cloned();
         let ssdp_info = ssdp_map.get(&ip).cloned();
         host_results.push(HostResult {
@@ -261,6 +287,7 @@ async fn run_scan(
             ports: port_results,
             os,
             traceroute: traceroute_hops,
+            dns_enum,
             warnings,
         });
     }
@@ -280,6 +307,7 @@ async fn run_scan(
                 ports: Vec::new(),
                 os: None,
                 traceroute: Vec::new(),
+                dns_enum: None,
                 warnings: Vec::new(),
             });
         }

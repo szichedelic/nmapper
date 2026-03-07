@@ -1,3 +1,4 @@
+pub mod dns_enum;
 pub mod host_discovery;
 pub mod mac_vendor;
 pub mod mdns;

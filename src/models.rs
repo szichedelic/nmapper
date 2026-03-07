@@ -40,6 +40,8 @@ pub struct HostResult {
     pub os: Option<OsFingerprint>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub traceroute: Vec<TracerouteHop>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_enum: Option<DnsEnumResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<crate::scanner::vuln_check::VulnWarning>,
 }
@@ -151,6 +153,20 @@ pub struct TracerouteHop {
     pub ip: Option<IpAddr>,
     pub hostname: Option<String>,
     pub rtt_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsEnumResult {
+    pub zone_transfer: Vec<String>,
+    pub subdomains: Vec<DnsRecord>,
+    pub reverse_dns: Vec<DnsRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsRecord {
+    pub name: String,
+    pub record_type: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

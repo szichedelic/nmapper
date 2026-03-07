@@ -99,6 +99,10 @@ pub struct Cli {
     #[arg(long = "traceroute")]
     pub traceroute: bool,
 
+    /// DNS enumeration (zone transfer, reverse DNS sweep)
+    #[arg(long = "dns-enum")]
+    pub dns_enum: bool,
+
     /// Increase verbosity
     #[arg(short, long)]
     pub verbose: bool,

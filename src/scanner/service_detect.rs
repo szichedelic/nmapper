@@ -54,26 +54,24 @@ pub async fn detect_services(
 
 /// Probe a single port to identify the running service.
 async fn probe_service(target: IpAddr, port: u16, timeout: Duration) -> Option<ServiceInfo> {
-    // First try: connect and grab the banner (many services send a banner immediately)
     let banner = grab_banner(target, port, timeout).await;
 
-    // If we got a banner, try to identify the service from it
     if let Some(ref banner_text) = banner {
         if let Some(service) = identify_from_banner(banner_text, port) {
             return Some(service);
         }
     }
 
-    // Second try: send protocol-specific probes
     if let Some(service) = protocol_probe(target, port, timeout).await {
         return Some(service);
     }
 
-    // Fallback: identify by port number alone
+    // Fall back to port-number-based name with the raw banner attached
     Some(ServiceInfo {
         name: port_to_service_name(port).to_string(),
         version: None,
         banner,
+        tls_info: None,
     })
 }
 
@@ -116,9 +114,351 @@ async fn protocol_probe(target: IpAddr, port: u16, timeout: Duration) -> Option<
         }
     }
 
-    // For any port, try HTTP as a last resort (many services run on non-standard ports)
+    if port == 53 {
+        if let Some(service) = dns_version_probe(target, port).await {
+            return Some(service);
+        }
+    }
+
+    if port == 1883 || port == 8883 {
+        if let Some(service) = mqtt_probe(addr, timeout).await {
+            return Some(service);
+        }
+    }
+
+    if port == 23 || port == 2323 {
+        if let Some(service) = telnet_probe(addr, timeout).await {
+            return Some(service);
+        }
+    }
+
+    if port == 6379 {
+        if let Some(service) = redis_probe(addr, timeout).await {
+            return Some(service);
+        }
+    }
+
+    if port == 445 {
+        if let Some(service) = smb_probe(addr, timeout).await {
+            return Some(service);
+        }
+    }
+
     if let Some(service) = http_probe(addr, timeout).await {
         return Some(service);
+    }
+
+    None
+}
+
+/// Query DNS TXT record for version.bind to get DNS server version.
+async fn dns_version_probe(target: IpAddr, port: u16) -> Option<ServiceInfo> {
+    use tokio::net::UdpSocket;
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let dest = SocketAddr::new(target, port);
+
+    // DNS query for version.bind TXT CH
+    let mut query = Vec::new();
+    query.extend_from_slice(&[0x00, 0x01]); // ID
+    query.extend_from_slice(&[0x00, 0x00]); // Flags: standard query
+    query.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+    query.extend_from_slice(&[0x00, 0x00]); // ANCOUNT
+    query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
+    query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
+    // QNAME: version.bind
+    query.push(7);
+    query.extend_from_slice(b"version");
+    query.push(4);
+    query.extend_from_slice(b"bind");
+    query.push(0);
+    query.extend_from_slice(&[0x00, 0x10]); // QTYPE: TXT
+    query.extend_from_slice(&[0x00, 0x03]); // QCLASS: CH
+
+    socket.send_to(&query, dest).await.ok()?;
+
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(
+        Duration::from_secs(3),
+        socket.recv(&mut buf),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    if n < 12 {
+        return None;
+    }
+
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]);
+    if ancount == 0 {
+        return Some(ServiceInfo {
+            name: "dns".to_string(),
+            version: None,
+            banner: None,
+            tls_info: None,
+        });
+    }
+
+    let version = extract_dns_txt(&buf[..n]);
+
+    Some(ServiceInfo {
+        name: "dns".to_string(),
+        version,
+        banner: None,
+        tls_info: None,
+    })
+}
+
+fn extract_dns_txt(data: &[u8]) -> Option<String> {
+    if data.len() < 12 {
+        return None;
+    }
+    // Skip header (12 bytes)
+    let mut offset = 12;
+    // Skip question section
+    while offset < data.len() {
+        if data[offset] == 0 {
+            offset += 5; // null + QTYPE(2) + QCLASS(2)
+            break;
+        }
+        if data[offset] & 0xC0 == 0xC0 {
+            offset += 6; // pointer(2) + QTYPE(2) + QCLASS(2)
+            break;
+        }
+        offset += 1 + data[offset] as usize;
+    }
+    // Parse answer RR
+    if offset + 12 > data.len() {
+        return None;
+    }
+    // Skip name
+    if data[offset] & 0xC0 == 0xC0 {
+        offset += 2;
+    } else {
+        while offset < data.len() && data[offset] != 0 {
+            offset += 1 + data[offset] as usize;
+        }
+        offset += 1;
+    }
+    if offset + 10 > data.len() {
+        return None;
+    }
+    let rdlength = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
+    offset += 10;
+    if offset + rdlength > data.len() || rdlength < 2 {
+        return None;
+    }
+    // TXT record: first byte is length of text
+    let txt_len = data[offset] as usize;
+    offset += 1;
+    if offset + txt_len > data.len() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&data[offset..offset + txt_len]).to_string())
+}
+
+/// MQTT CONNECT probe to detect MQTT brokers.
+async fn mqtt_probe(addr: SocketAddr, timeout: Duration) -> Option<ServiceInfo> {
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+
+    // MQTT CONNECT packet (minimal)
+    let connect_packet: &[u8] = &[
+        0x10, // CONNECT packet type
+        0x10, // Remaining length (16)
+        0x00, 0x04, b'M', b'Q', b'T', b'T', // Protocol Name
+        0x04, // Protocol Level (MQTT 3.1.1)
+        0x02, // Connect Flags (Clean Session)
+        0x00, 0x3C, // Keep Alive (60 seconds)
+        0x00, 0x04, b'n', b'm', b'a', b'p', // Client ID: "nmap"
+    ];
+
+    stream.write_all(connect_packet).await.ok()?;
+
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+
+    if n >= 2 && (buf[0] >> 4) == 2 {
+        let return_code = if n >= 4 { buf[3] } else { 255 };
+        let version = match return_code {
+            0 => Some("MQTT 3.1.1 (connection accepted)".to_string()),
+            5 => Some("MQTT 3.1.1 (not authorized)".to_string()),
+            _ => Some(format!("MQTT 3.1.1 (code: {})", return_code)),
+        };
+        return Some(ServiceInfo {
+            name: "mqtt".to_string(),
+            version,
+            banner: None,
+            tls_info: None,
+        });
+    }
+
+    None
+}
+
+/// Telnet banner grab with negotiation handling.
+async fn telnet_probe(addr: SocketAddr, timeout: Duration) -> Option<ServiceInfo> {
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+
+    let mut buf = [0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+
+    if n == 0 {
+        return None;
+    }
+
+    // Strip IAC negotiation sequences (0xFF cmd opt triples) before decoding text
+    let mut text = String::new();
+    let mut i = 0;
+    while i < n {
+        if buf[i] == 0xFF && i + 2 < n {
+            i += 3;
+        } else if buf[i].is_ascii_graphic() || buf[i] == b' ' || buf[i] == b'\n' {
+            text.push(buf[i] as char);
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    let banner = text.trim().to_string();
+    Some(ServiceInfo {
+        name: "telnet".to_string(),
+        version: if banner.is_empty() {
+            None
+        } else {
+            Some(banner.clone())
+        },
+        banner: if banner.is_empty() {
+            None
+        } else {
+            Some(banner)
+        },
+        tls_info: None,
+    })
+}
+
+/// Redis INFO probe.
+async fn redis_probe(addr: SocketAddr, timeout: Duration) -> Option<ServiceInfo> {
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+
+    stream.write_all(b"INFO server\r\n").await.ok()?;
+
+    let mut buf = [0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+
+    let response = String::from_utf8_lossy(&buf[..n]);
+
+    if response.contains("redis_version:") {
+        let version = response
+            .lines()
+            .find(|l| l.starts_with("redis_version:"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|v| format!("Redis {}", v.trim()));
+
+        return Some(ServiceInfo {
+            name: "redis".to_string(),
+            version,
+            banner: Some(response.lines().take(5).collect::<Vec<_>>().join("\n")),
+            tls_info: None,
+        });
+    }
+
+    if response.contains("-NOAUTH") || response.contains("-ERR") {
+        return Some(ServiceInfo {
+            name: "redis".to_string(),
+            version: Some("Redis (auth required)".to_string()),
+            banner: Some(response.trim().to_string()),
+            tls_info: None,
+        });
+    }
+
+    None
+}
+
+/// SMB probe - negotiate protocol to extract server info.
+async fn smb_probe(addr: SocketAddr, timeout: Duration) -> Option<ServiceInfo> {
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+
+    // SMB Negotiate Protocol Request (minimal, for SMB2)
+    let negotiate: &[u8] = &[
+        // NetBIOS Session header
+        0x00, 0x00, 0x00, 0x2F, // length = 47
+        // SMB2 header
+        0xFE, b'S', b'M', b'B', // Protocol ID
+        0x40, 0x00, // Structure Size (64)
+        0x00, 0x00, // Credit Charge
+        0x00, 0x00, 0x00, 0x00, // Status
+        0x00, 0x00, // Command: Negotiate
+        0x00, 0x00, // Credits
+        0x00, 0x00, 0x00, 0x00, // Flags
+        0x00, 0x00, 0x00, 0x00, // Next Command
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Message ID
+        0x00, 0x00, 0x00, 0x00, // Process ID
+        0x00, 0x00, 0x00, 0x00, // Tree ID
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Session ID
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, // Signature
+        // Negotiate body (minimal)
+        0x24, 0x00, // Structure Size
+        0x01, 0x00, // Dialect Count: 1
+        0x00, 0x00, // Security Mode
+        0x00, 0x00, // Reserved
+        0x00, 0x00, 0x00, 0x00, // Capabilities
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, // Client GUID
+        0x00, 0x00, 0x00, 0x00, // Negotiate Context Offset
+        0x00, 0x00, // Negotiate Context Count
+        0x00, 0x00, // Reserved2
+        0x02, 0x02, // Dialect: SMB 2.002
+    ];
+
+    stream.write_all(negotiate).await.ok()?;
+
+    let mut buf = [0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+
+    if n > 4 {
+        if n > 8 && buf[4] == 0xFE && buf[5] == b'S' && buf[6] == b'M' && buf[7] == b'B' {
+            return Some(ServiceInfo {
+                name: "smb".to_string(),
+                version: Some("SMB2".to_string()),
+                banner: None,
+                tls_info: None,
+            });
+        }
+        if n > 8 && buf[4] == 0xFF && buf[5] == b'S' && buf[6] == b'M' && buf[7] == b'B' {
+            return Some(ServiceInfo {
+                name: "smb".to_string(),
+                version: Some("SMB1".to_string()),
+                banner: None,
+                tls_info: None,
+            });
+        }
     }
 
     None
@@ -154,7 +494,6 @@ async fn http_probe(addr: SocketAddr, timeout: Duration) -> Option<ServiceInfo> 
         return None;
     }
 
-    // Extract Server header
     let version = response
         .lines()
         .find(|line| line.to_lowercase().starts_with("server:"))
@@ -164,33 +503,33 @@ async fn http_probe(addr: SocketAddr, timeout: Duration) -> Option<ServiceInfo> 
         name: "http".to_string(),
         version,
         banner: Some(response.lines().next().unwrap_or_default().to_string()),
+        tls_info: None,
     })
 }
 
 fn identify_from_banner(banner: &str, port: u16) -> Option<ServiceInfo> {
     let banner_lower = banner.to_lowercase();
 
-    // SSH
     if banner_lower.starts_with("ssh-") {
         let version = banner.split_whitespace().next().map(String::from);
         return Some(ServiceInfo {
             name: "ssh".to_string(),
             version,
             banner: Some(banner.to_string()),
+            tls_info: None,
         });
     }
 
-    // FTP
     if banner_lower.starts_with("220") && (banner_lower.contains("ftp") || port == 21) {
         let version = extract_version_from_220(banner);
         return Some(ServiceInfo {
             name: "ftp".to_string(),
             version,
             banner: Some(banner.to_string()),
+            tls_info: None,
         });
     }
 
-    // SMTP
     if banner_lower.starts_with("220")
         && (banner_lower.contains("smtp")
             || banner_lower.contains("mail")
@@ -202,28 +541,28 @@ fn identify_from_banner(banner: &str, port: u16) -> Option<ServiceInfo> {
             name: "smtp".to_string(),
             version,
             banner: Some(banner.to_string()),
+            tls_info: None,
         });
     }
 
-    // POP3
     if banner_lower.starts_with("+ok") {
         return Some(ServiceInfo {
             name: "pop3".to_string(),
             version: None,
             banner: Some(banner.to_string()),
+            tls_info: None,
         });
     }
 
-    // IMAP
     if banner_lower.contains("imap") || (banner_lower.starts_with("* ok") && port == 143) {
         return Some(ServiceInfo {
             name: "imap".to_string(),
             version: None,
             banner: Some(banner.to_string()),
+            tls_info: None,
         });
     }
 
-    // MySQL
     if (port == 3306 || banner.len() > 4 && banner.as_bytes().get(4) == Some(&0x0a))
         && (banner_lower.contains("mysql") || banner_lower.contains("mariadb"))
     {
@@ -231,19 +570,19 @@ fn identify_from_banner(banner: &str, port: u16) -> Option<ServiceInfo> {
             name: "mysql".to_string(),
             version: extract_mysql_version(banner),
             banner: Some(banner.to_string()),
+            tls_info: None,
         });
     }
 
-    // PostgreSQL
     if banner_lower.contains("postgresql") || port == 5432 {
         return Some(ServiceInfo {
             name: "postgresql".to_string(),
             version: None,
             banner: Some(banner.to_string()),
+            tls_info: None,
         });
     }
 
-    // Redis
     if banner_lower.contains("redis")
         || banner_lower.starts_with("-err")
         || banner_lower.starts_with("-noauth")
@@ -252,10 +591,10 @@ fn identify_from_banner(banner: &str, port: u16) -> Option<ServiceInfo> {
             name: "redis".to_string(),
             version: None,
             banner: Some(banner.to_string()),
+            tls_info: None,
         });
     }
 
-    // HTTP response
     if banner.starts_with("HTTP/") {
         let version = banner
             .lines()
@@ -266,6 +605,7 @@ fn identify_from_banner(banner: &str, port: u16) -> Option<ServiceInfo> {
             name: "http".to_string(),
             version,
             banner: Some(banner.lines().next().unwrap_or_default().to_string()),
+            tls_info: None,
         });
     }
 
@@ -273,7 +613,6 @@ fn identify_from_banner(banner: &str, port: u16) -> Option<ServiceInfo> {
 }
 
 fn extract_version_from_220(banner: &str) -> Option<String> {
-    // "220 server FTPd 1.2.3 Ready" → "FTPd 1.2.3"
     let parts: Vec<&str> = banner.splitn(2, ' ').collect();
     if parts.len() > 1 {
         Some(parts[1].trim().to_string())
@@ -283,7 +622,6 @@ fn extract_version_from_220(banner: &str) -> Option<String> {
 }
 
 fn extract_mysql_version(banner: &str) -> Option<String> {
-    // MySQL banner often has version string after the first few bytes
     banner
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == '.')

@@ -103,6 +103,10 @@ pub struct Cli {
     #[arg(long = "dns-enum")]
     pub dns_enum: bool,
 
+    /// HTTP path/directory discovery on web servers
+    #[arg(long = "http-enum")]
+    pub http_enum: bool,
+
     /// Increase verbosity
     #[arg(short, long)]
     pub verbose: bool,

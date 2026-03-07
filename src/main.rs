@@ -274,6 +274,31 @@ async fn run_scan(
             None
         };
 
+        let http_paths = if cli.http_enum {
+            let http_ports: Vec<u16> = port_results
+                .iter()
+                .filter(|p| {
+                    p.state == PortState::Open
+                        && matches!(p.port, 80 | 443 | 8080 | 8443 | 8000 | 8888 | 3000 | 5000)
+                })
+                .map(|p| p.port)
+                .collect();
+            let mut results = Vec::new();
+            for port in http_ports {
+                eprintln!(
+                    "{}",
+                    format!("  [*] HTTP enumeration on port {port}...").dimmed()
+                );
+                let result = scanner::http_enum::http_enumerate(ip, port, cli.verbose);
+                if !result.paths.is_empty() {
+                    results.push(result);
+                }
+            }
+            results
+        } else {
+            Vec::new()
+        };
+
         let mdns_names = mdns_map.get(&ip).cloned();
         let ssdp_info = ssdp_map.get(&ip).cloned();
         host_results.push(HostResult {
@@ -288,6 +313,7 @@ async fn run_scan(
             os,
             traceroute: traceroute_hops,
             dns_enum,
+            http_paths,
             warnings,
         });
     }
@@ -308,6 +334,7 @@ async fn run_scan(
                 os: None,
                 traceroute: Vec::new(),
                 dns_enum: None,
+                http_paths: Vec::new(),
                 warnings: Vec::new(),
             });
         }

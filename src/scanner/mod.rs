@@ -1,5 +1,6 @@
 pub mod dns_enum;
 pub mod host_discovery;
+pub mod http_enum;
 pub mod mac_vendor;
 pub mod mdns;
 pub mod os_fingerprint;

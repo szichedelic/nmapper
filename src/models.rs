@@ -43,6 +43,8 @@ pub struct HostResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_enum: Option<DnsEnumResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub http_paths: Vec<HttpPathResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<crate::scanner::vuln_check::VulnWarning>,
 }
 
@@ -167,6 +169,20 @@ pub struct DnsRecord {
     pub name: String,
     pub record_type: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HttpPathResult {
+    pub port: u16,
+    pub paths: Vec<HttpPath>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HttpPath {
+    pub path: String,
+    pub status: u16,
+    pub content_length: Option<u64>,
+    pub redirect: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

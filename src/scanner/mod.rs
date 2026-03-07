@@ -1,4 +1,10 @@
 pub mod host_discovery;
+pub mod mac_vendor;
+pub mod mdns;
 pub mod os_fingerprint;
+pub mod passive;
 pub mod port_scanner;
+pub mod ssdp;
 pub mod service_detect;
+pub mod tls_inspect;
+pub mod vuln_check;

@@ -1,3 +1,4 @@
+use pnet::util::MacAddr;
 use serde::Serialize;
 use std::fmt;
 use std::net::IpAddr;
@@ -23,9 +24,31 @@ pub struct ScanInfo {
 pub struct HostResult {
     pub ip: IpAddr,
     pub hostname: Option<String>,
+    #[serde(
+        serialize_with = "serialize_mac_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mac_address: Option<MacAddr>,
+    pub vendor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mdns_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssdp_info: Option<Vec<String>>,
     pub status: HostStatus,
     pub ports: Vec<PortResult>,
     pub os: Option<OsFingerprint>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::scanner::vuln_check::VulnWarning>,
+}
+
+fn serialize_mac_option<S>(mac: &Option<MacAddr>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match mac {
+        Some(m) => serializer.serialize_str(&m.to_string()),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -90,6 +113,18 @@ pub struct ServiceInfo {
     pub name: String,
     pub version: Option<String>,
     pub banner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_info: Option<TlsInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TlsInfo {
+    pub subject: String,
+    pub issuer: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub sans: Vec<String>,
+    pub protocol_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +171,7 @@ pub enum DiscoveryMethod {
 pub enum OutputFormat {
     Table,
     Json,
+    Html,
     Both,
 }
 

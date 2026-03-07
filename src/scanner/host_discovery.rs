@@ -19,6 +19,7 @@ use crate::models::{DiscoveryMethod, HostStatus, TimingConfig};
 pub struct DiscoveryResult {
     pub ip: IpAddr,
     pub status: HostStatus,
+    pub mac_address: Option<MacAddr>,
 }
 
 pub async fn discover_hosts(
@@ -33,6 +34,7 @@ pub async fn discover_hosts(
             .map(|ip| DiscoveryResult {
                 ip: *ip,
                 status: HostStatus::Up,
+                mac_address: None,
             })
             .collect(),
         DiscoveryMethod::Icmp => icmp_sweep(targets, timing, verbose).await,
@@ -102,7 +104,11 @@ fn icmp_ping(ip: IpAddr, timeout: Duration) -> DiscoveryResult {
         IpAddr::V4(ipv4) => icmp_ping_v4(ipv4, timeout),
         IpAddr::V6(_) => HostStatus::Unknown,
     };
-    DiscoveryResult { ip, status }
+    DiscoveryResult {
+        ip,
+        status,
+        mac_address: None,
+    }
 }
 
 fn icmp_ping_v4(target: Ipv4Addr, timeout: Duration) -> HostStatus {
@@ -189,13 +195,11 @@ fn icmp_ping_raw(target: Ipv4Addr, timeout: Duration) -> HostStatus {
 
         match socket.recv(&mut recv_buf) {
             Ok(n) if n >= 28 => {
-                // IP header: first 20 bytes (assuming no options)
                 let ip_header_len = unsafe { (recv_buf[0].assume_init() & 0x0F) as usize * 4 };
                 if n < ip_header_len + 8 {
                     continue;
                 }
 
-                // Verify source IP matches target
                 let src_ip = unsafe {
                     Ipv4Addr::new(
                         recv_buf[12].assume_init(),
@@ -208,7 +212,7 @@ fn icmp_ping_raw(target: Ipv4Addr, timeout: Duration) -> HostStatus {
                     continue;
                 }
 
-                // ICMP header starts after IP header
+                // ICMP starts after the IP header
                 let icmp_type = unsafe { recv_buf[ip_header_len].assume_init() };
 
                 // Type 0 = Echo Reply
@@ -228,7 +232,6 @@ fn icmp_ping_raw(target: Ipv4Addr, timeout: Duration) -> HostStatus {
                     return HostStatus::Down;
                 }
 
-                // Other ICMP types — keep waiting
                 continue;
             }
             Ok(_) => continue,
@@ -243,7 +246,6 @@ fn build_icmp_echo_request() -> [u8; 8] {
         echo.set_icmp_type(IcmpTypes::EchoRequest);
         echo.set_identifier(icmp_id());
         echo.set_sequence_number(1);
-        // Checksum must be computed over the packet with checksum field set to 0
         let raw = echo.packet().to_vec();
         let cksum = internet_checksum(&raw);
         echo.set_checksum(cksum);
@@ -356,7 +358,7 @@ async fn arp_sweep(
     );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let mut seen: std::collections::HashSet<IpAddr> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<IpAddr, MacAddr> = std::collections::HashMap::new();
 
     while tokio::time::Instant::now() < deadline {
         match rx.next() {
@@ -365,13 +367,13 @@ async fn arp_sweep(
                     if let Some(arp) = ArpPacket::new(&packet[14..]) {
                         if arp.get_operation() == ArpOperations::Reply {
                             let sender_ip = IpAddr::V4(arp.get_sender_proto_addr());
-                            if !seen.contains(&sender_ip) {
-                                seen.insert(sender_ip);
+                            let sender_mac = arp.get_sender_hw_addr();
+                            if !seen.contains_key(&sender_ip) {
+                                seen.insert(sender_ip, sender_mac);
                                 if verbose {
                                     eprintln!(
                                         "  [+] Host {} is up (ARP from {})",
-                                        sender_ip,
-                                        arp.get_sender_hw_addr()
+                                        sender_ip, sender_mac
                                     );
                                 }
                             }
@@ -393,11 +395,12 @@ async fn arp_sweep(
         .iter()
         .map(|&ip| DiscoveryResult {
             ip,
-            status: if seen.contains(&ip) {
+            status: if seen.contains_key(&ip) {
                 HostStatus::Up
             } else {
                 HostStatus::Down
             },
+            mac_address: seen.get(&ip).copied(),
         })
         .collect()
 }
@@ -449,6 +452,7 @@ async fn tcp_ping(ip: IpAddr, timeout: Duration, verbose: bool) -> DiscoveryResu
                 return DiscoveryResult {
                     ip,
                     status: HostStatus::Up,
+                    mac_address: None,
                 };
             }
             Ok(Err(e)) => {
@@ -460,6 +464,7 @@ async fn tcp_ping(ip: IpAddr, timeout: Duration, verbose: bool) -> DiscoveryResu
                     return DiscoveryResult {
                         ip,
                         status: HostStatus::Up,
+                        mac_address: None,
                     };
                 }
             }
@@ -470,5 +475,6 @@ async fn tcp_ping(ip: IpAddr, timeout: Duration, verbose: bool) -> DiscoveryResu
     DiscoveryResult {
         ip,
         status: HostStatus::Down,
+        mac_address: None,
     }
 }

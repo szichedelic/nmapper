@@ -35,7 +35,15 @@ pub struct Cli {
     #[arg(long = "sV")]
     pub service_version: bool,
 
-    /// Output format: table, json, both
+    /// Enable mDNS/Bonjour device discovery
+    #[arg(long = "mdns")]
+    pub mdns: bool,
+
+    /// Enable SSDP/UPnP device discovery
+    #[arg(long = "ssdp")]
+    pub ssdp: bool,
+
+    /// Output format: table, json, html, both
     #[arg(short = 'o', long = "output", default_value = "table")]
     pub output: String,
 
@@ -46,6 +54,30 @@ pub struct Cli {
     /// Timing template 0-5 (0=paranoid, 3=normal, 5=insane)
     #[arg(short = 'T', long = "timing", default_value = "3")]
     pub timing: u8,
+
+    /// Compare results against previous scan (diff mode)
+    #[arg(long = "diff")]
+    pub diff: bool,
+
+    /// Check for default credentials and open service warnings
+    #[arg(long = "vuln-check")]
+    pub vuln_check: bool,
+
+    /// Passive discovery mode (listen only, no probes sent)
+    #[arg(long = "passive")]
+    pub passive: bool,
+
+    /// Duration in seconds for passive discovery
+    #[arg(long = "duration", default_value = "30")]
+    pub duration: u64,
+
+    /// Continuous scanning mode with alerts on changes
+    #[arg(long = "watch")]
+    pub watch: bool,
+
+    /// Interval in seconds between watch mode scans
+    #[arg(long = "interval", default_value = "300")]
+    pub interval: u64,
 
     /// Increase verbosity
     #[arg(short, long)]

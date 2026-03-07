@@ -65,6 +65,14 @@ fn print_host(host: &HostResult) {
         host.ip.to_string().cyan().bold(),
         hostname_str.dimmed()
     );
+    if let Some(ref mac) = host.mac_address {
+        let vendor_str = host
+            .vendor
+            .as_ref()
+            .map(|v| format!(" ({v})"))
+            .unwrap_or_default();
+        println!("MAC: {}{}", mac.to_string().cyan(), vendor_str.dimmed());
+    }
     println!(
         "Status: {}",
         match host.status {
@@ -73,6 +81,18 @@ fn print_host(host: &HostResult) {
             HostStatus::Unknown => "unknown".yellow(),
         }
     );
+
+    if let Some(ref names) = host.mdns_names {
+        if !names.is_empty() {
+            println!("mDNS: {}", names.join(", ").yellow());
+        }
+    }
+
+    if let Some(ref ssdp) = host.ssdp_info {
+        if !ssdp.is_empty() {
+            println!("SSDP: {}", ssdp.join(", ").yellow());
+        }
+    }
 
     if let Some(ref os) = host.os {
         println!(
@@ -138,6 +158,27 @@ fn print_host(host: &HostResult) {
 
     println!("{table}");
 
+    for port in &open_ports {
+        if let Some(ref svc) = port.service {
+            if let Some(ref tls) = svc.tls_info {
+                println!(
+                    "  {} TLS on port {}: {}",
+                    "TLS:".magenta().bold(),
+                    port.port,
+                    tls.subject.cyan()
+                );
+                println!("      Issuer: {}", tls.issuer.dimmed());
+                println!(
+                    "      Valid: {} to {}",
+                    tls.not_before, tls.not_after
+                );
+                if !tls.sans.is_empty() {
+                    println!("      SANs: {}", tls.sans.join(", ").dimmed());
+                }
+            }
+        }
+    }
+
     let closed_count = host
         .ports
         .iter()
@@ -148,6 +189,22 @@ fn print_host(host: &HostResult) {
         .iter()
         .filter(|p| p.state == PortState::Filtered)
         .count();
+
+    if !host.warnings.is_empty() {
+        println!();
+        for warning in &host.warnings {
+            let severity_colored = match warning.severity.as_str() {
+                "critical" => warning.severity.to_uppercase().red().bold(),
+                "high" => warning.severity.to_uppercase().red(),
+                "medium" => warning.severity.to_uppercase().yellow(),
+                _ => warning.severity.to_uppercase().dimmed(),
+            };
+            println!(
+                "  [!] {} (port {}): {}",
+                severity_colored, warning.port, warning.description
+            );
+        }
+    }
 
     if closed_count > 0 || filtered_count > 0 {
         let mut parts = Vec::new();

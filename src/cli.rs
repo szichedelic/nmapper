@@ -19,7 +19,7 @@ pub struct Cli {
     #[arg(short, long, default_value = "common")]
     pub ports: String,
 
-    /// Scan type: syn, connect, udp
+    /// Scan type: syn, connect, udp, fin, null, xmas
     #[arg(short = 's', long = "scan-type", default_value = "syn")]
     pub scan_type: String,
 
@@ -78,6 +78,22 @@ pub struct Cli {
     /// Interval in seconds between watch mode scans
     #[arg(long = "interval", default_value = "300")]
     pub interval: u64,
+
+    /// Randomize TCP window size and TTL per probe (OS fingerprint evasion)
+    #[arg(long = "randomize-tcp")]
+    pub randomize_tcp: bool,
+
+    /// Decoy IP addresses to mix into raw scan probes (e.g., 10.0.0.1,10.0.0.2)
+    #[arg(long = "decoys", value_delimiter = ',')]
+    pub decoys: Vec<String>,
+
+    /// Fragment IP packets to evade deep packet inspection (raw scans only)
+    #[arg(long = "fragment")]
+    pub fragment: bool,
+
+    /// Interleave scanning across hosts (scan port X on all hosts, then port Y)
+    #[arg(long = "interleave")]
+    pub interleave: bool,
 
     /// Increase verbosity
     #[arg(short, long)]

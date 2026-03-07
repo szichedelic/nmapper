@@ -11,6 +11,7 @@ use std::time::Instant;
 use anyhow::{bail, Result};
 use clap::Parser;
 use colored::Colorize;
+use rand::seq::SliceRandom;
 
 use cli::Cli;
 use models::*;
@@ -20,6 +21,7 @@ use scanner::{
     host_discovery, mac_vendor, mdns, os_fingerprint, port_scanner, service_detect, ssdp,
     tls_inspect, vuln_check,
 };
+use port_scanner::RawScanOpts;
 
 async fn run_scan(
     targets: &[IpAddr],
@@ -27,6 +29,7 @@ async fn run_scan(
     scan_type: ScanType,
     discovery: DiscoveryMethod,
     timing: &TimingConfig,
+    raw_opts: &RawScanOpts,
     cli: &Cli,
 ) -> Result<ScanResult> {
     let start_time = Instant::now();
@@ -38,11 +41,14 @@ async fn run_scan(
     let discovery_results =
         host_discovery::discover_hosts(targets, discovery, timing, cli.verbose).await;
 
-    let live_hosts: Vec<IpAddr> = discovery_results
+    let mut live_hosts: Vec<IpAddr> = discovery_results
         .iter()
         .filter(|r| r.status == HostStatus::Up)
         .map(|r| r.ip)
         .collect();
+
+    // Randomize host scan order for stealth
+    live_hosts.shuffle(&mut rand::thread_rng());
 
     eprintln!(
         "{}",
@@ -104,6 +110,42 @@ async fn run_scan(
     let mut host_results = Vec::new();
     let mut port_count = 0;
 
+    // Interleave mode: scan one port across all hosts, then next port
+    // This distributes probes across targets, making per-host detection harder
+    let interleaved_port_results: HashMap<IpAddr, Vec<PortResult>> = if cli.interleave && live_hosts.len() > 1 {
+        eprintln!(
+            "{}",
+            "[*] Interleave mode: distributing probes across hosts".dimmed()
+        );
+        let mut results_map: HashMap<IpAddr, Vec<PortResult>> = HashMap::new();
+        for &ip in &live_hosts {
+            results_map.insert(ip, Vec::new());
+        }
+
+        let mut shuffled_ports: Vec<u16> = ports.to_vec();
+        shuffled_ports.shuffle(&mut rand::thread_rng());
+
+        for &port in &shuffled_ports {
+            let port_slice = &[port];
+            for &ip in &live_hosts {
+                let mut result =
+                    port_scanner::scan_ports(ip, port_slice, scan_type, timing, raw_opts, cli.verbose).await;
+                if let Some(entry) = results_map.get_mut(&ip) {
+                    entry.append(&mut result);
+                }
+            }
+        }
+
+        // Sort each host's results by port number
+        for results in results_map.values_mut() {
+            results.sort_by_key(|r| r.port);
+        }
+        port_count = results_map.values().map(|v| v.len()).sum();
+        results_map
+    } else {
+        HashMap::new()
+    };
+
     for &ip in &live_hosts {
         eprintln!();
         eprintln!("{}", format!("[*] Scanning {ip}...").dimmed());
@@ -127,13 +169,18 @@ async fn run_scan(
             }
         }
 
-        eprintln!(
-            "{}",
-            format!("  [*] Port scanning ({} ports)...", ports.len()).dimmed()
-        );
-        let mut port_results =
-            port_scanner::scan_ports(ip, ports, scan_type, timing, cli.verbose).await;
-        port_count += port_results.len();
+        let mut port_results = if cli.interleave && live_hosts.len() > 1 {
+            interleaved_port_results.get(&ip).cloned().unwrap_or_default()
+        } else {
+            eprintln!(
+                "{}",
+                format!("  [*] Port scanning ({} ports)...", ports.len()).dimmed()
+            );
+            let results =
+                port_scanner::scan_ports(ip, ports, scan_type, timing, raw_opts, cli.verbose).await;
+            port_count += results.len();
+            results
+        };
 
         let open_count = port_results
             .iter()
@@ -400,7 +447,10 @@ async fn main() -> Result<()> {
         "syn" => ScanType::Syn,
         "connect" => ScanType::Connect,
         "udp" => ScanType::Udp,
-        other => bail!("Unknown scan type: {other}. Use: syn, connect, udp"),
+        "fin" => ScanType::Fin,
+        "null" => ScanType::Null,
+        "xmas" => ScanType::Xmas,
+        other => bail!("Unknown scan type: {other}. Use: syn, connect, udp, fin, null, xmas"),
     };
 
     let discovery = match cli.discovery.to_lowercase().as_str() {
@@ -427,7 +477,27 @@ async fn main() -> Result<()> {
         timing.timeout_ms = timeout;
     }
 
-    let needs_root = matches!(scan_type, ScanType::Syn)
+    let decoy_ips: Vec<std::net::Ipv4Addr> = cli
+        .decoys
+        .iter()
+        .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        .collect();
+
+    if !cli.decoys.is_empty() && decoy_ips.len() != cli.decoys.len() {
+        eprintln!(
+            "{}",
+            "WARNING: Some decoy IPs could not be parsed and were skipped."
+                .yellow()
+        );
+    }
+
+    let raw_opts = RawScanOpts {
+        randomize_tcp: cli.randomize_tcp,
+        decoys: decoy_ips,
+        fragment: cli.fragment,
+    };
+
+    let needs_root = scan_type.is_raw()
         || matches!(discovery, DiscoveryMethod::Arp)
         || cli.os_detect;
 
@@ -524,7 +594,7 @@ async fn main() -> Result<()> {
             }
 
             let scan_result =
-                run_scan(&targets, &ports, scan_type, discovery, &timing, &cli).await?;
+                run_scan(&targets, &ports, scan_type, discovery, &timing, &raw_opts, &cli).await?;
 
             if let Some(ref prev) = prev_result {
                 print_watch_diff(prev, &scan_result, iteration);
@@ -547,7 +617,7 @@ async fn main() -> Result<()> {
         }
     } else {
         let scan_result =
-            run_scan(&targets, &ports, scan_type, discovery, &timing, &cli).await?;
+            run_scan(&targets, &ports, scan_type, discovery, &timing, &raw_opts, &cli).await?;
 
         output_results(&scan_result, output_format, &cli)?;
     }

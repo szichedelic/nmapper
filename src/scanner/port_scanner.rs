@@ -9,21 +9,33 @@ use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
 use pnet::packet::Packet;
+use rand::seq::SliceRandom;
 use rand::Rng;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
 use crate::models::{PortResult, PortState, Protocol, ScanType, TimingConfig};
 
+/// Options for raw scan features (decoys, fragmentation, TCP randomization).
+#[derive(Debug, Clone, Default)]
+pub struct RawScanOpts {
+    pub randomize_tcp: bool,
+    pub decoys: Vec<Ipv4Addr>,
+    pub fragment: bool,
+}
+
 pub async fn scan_ports(
     target: IpAddr,
     ports: &[u16],
     scan_type: ScanType,
     timing: &TimingConfig,
+    raw_opts: &RawScanOpts,
     verbose: bool,
 ) -> Vec<PortResult> {
     match scan_type {
-        ScanType::Syn => syn_scan(target, ports, timing, verbose).await,
+        ScanType::Syn | ScanType::Fin | ScanType::Null | ScanType::Xmas => {
+            raw_scan(target, ports, scan_type, timing, raw_opts, verbose).await
+        }
         ScanType::Connect => connect_scan(target, ports, timing, verbose).await,
         ScanType::Udp => udp_scan(target, ports, timing, verbose).await,
     }
@@ -143,13 +155,15 @@ fn get_next_hop_ip(
     get_default_gateway().unwrap_or(target)
 }
 
-/// TCP SYN (half-open) scan using BPF datalink channel.
+/// Raw TCP scan using BPF datalink channel (SYN, FIN, NULL, Xmas).
 /// On macOS, raw TCP sockets cannot receive incoming packets, so we use BPF
-/// to send and receive raw Ethernet frames containing our TCP SYN probes.
-async fn syn_scan(
+/// to send and receive raw Ethernet frames containing our TCP probes.
+async fn raw_scan(
     target: IpAddr,
     ports: &[u16],
+    scan_type: ScanType,
     timing: &TimingConfig,
+    raw_opts: &RawScanOpts,
     verbose: bool,
 ) -> Vec<PortResult> {
     let target_v4 = match target {
@@ -215,8 +229,8 @@ async fn syn_scan(
 
     if verbose {
         eprintln!(
-            "  [*] SYN scan via {} (src={src_ip}, dst_mac={dst_mac})",
-            interface.name
+            "  [*] {} scan via {} (src={src_ip}, dst_mac={dst_mac})",
+            scan_type, interface.name
         );
     }
 
@@ -235,13 +249,13 @@ async fn syn_scan(
         }
     };
 
-    syn_scan_bpf(
-        &mut tx, &mut rx, src_ip, src_mac, target_v4, dst_mac, ports, timing, verbose,
+    raw_scan_bpf(
+        &mut tx, &mut rx, src_ip, src_mac, target_v4, dst_mac, ports, scan_type, timing, raw_opts, verbose,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn syn_scan_bpf(
+fn raw_scan_bpf(
     tx: &mut Box<dyn datalink::DataLinkSender>,
     rx: &mut Box<dyn datalink::DataLinkReceiver>,
     src_ip: Ipv4Addr,
@@ -249,7 +263,9 @@ fn syn_scan_bpf(
     target_v4: Ipv4Addr,
     dst_mac: MacAddr,
     ports: &[u16],
+    scan_type: ScanType,
     timing: &TimingConfig,
+    raw_opts: &RawScanOpts,
     verbose: bool,
 ) -> Vec<PortResult> {
     let mut rng = rand::thread_rng();
@@ -260,11 +276,18 @@ fn syn_scan_bpf(
         results_map.insert(port, PortState::Filtered);
     }
 
+    // Randomize port order for stealth
+    let mut shuffled_ports: Vec<u16> = ports.to_vec();
+    shuffled_ports.shuffle(&mut rng);
+
+    if verbose {
+        eprintln!("  [*] Port order randomized for stealth");
+    }
+
     // Send phase: blast SYN packets as raw Ethernet frames
-    let delay = Duration::from_millis(timing.delay_ms);
     let mut ip_id: u16 = rng.gen();
 
-    for &port in ports {
+    for &port in &shuffled_ports {
         let src_port: u16 = rng.gen_range(49152..65535);
         port_map.insert(src_port, port);
 
@@ -288,7 +311,13 @@ fn syn_scan_bpf(
             ip.set_identification(ip_id);
             ip_id = ip_id.wrapping_add(1);
             ip.set_flags(0x02); // Don't Fragment
-            ip.set_ttl(64);
+            let ttl = if raw_opts.randomize_tcp {
+                const TTLS: [u8; 4] = [64, 128, 255, 64];
+                TTLS[rng.gen_range(0..TTLS.len())]
+            } else {
+                64
+            };
+            ip.set_ttl(ttl);
             ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
             ip.set_source(src_ip);
             ip.set_destination(target_v4);
@@ -304,8 +333,21 @@ fn syn_scan_bpf(
             tcp.set_sequence(rng.gen());
             tcp.set_acknowledgement(0);
             tcp.set_data_offset(5);
-            tcp.set_flags(TcpFlags::SYN);
-            tcp.set_window(64240);
+            let tcp_flags = match scan_type {
+                ScanType::Syn => TcpFlags::SYN,
+                ScanType::Fin => TcpFlags::FIN,
+                ScanType::Null => 0,
+                ScanType::Xmas => TcpFlags::FIN | TcpFlags::PSH | TcpFlags::URG,
+                _ => TcpFlags::SYN,
+            };
+            tcp.set_flags(tcp_flags);
+            let window = if raw_opts.randomize_tcp {
+                const WINDOWS: [u16; 6] = [5840, 8192, 16384, 29200, 64240, 65535];
+                WINDOWS[rng.gen_range(0..WINDOWS.len())]
+            } else {
+                64240
+            };
+            tcp.set_window(window);
             tcp.set_urgent_ptr(0);
             let cksum = pnet::packet::tcp::ipv4_checksum(
                 &tcp.to_immutable(),
@@ -315,8 +357,69 @@ fn syn_scan_bpf(
             tcp.set_checksum(cksum);
         }
 
-        tx.send_to(&buf, None);
+        if raw_opts.fragment {
+            // Fragment 1: IP header (MF set, offset=0) + first 8 bytes of TCP
+            let mut frag1 = [0u8; 42]; // 14 eth + 20 ip + 8 tcp
+            frag1[0..14].copy_from_slice(&buf[0..14]);
+            frag1[14..34].copy_from_slice(&buf[14..34]);
+            frag1[34..42].copy_from_slice(&buf[34..42]);
+            // Set total_length = 28 (20 IP + 8 data)
+            {
+                let mut ip = MutableIpv4Packet::new(&mut frag1[14..34]).unwrap();
+                ip.set_total_length(28);
+                ip.set_flags(0x01); // MF (More Fragments)
+                ip.set_fragment_offset(0);
+                let cksum = pnet::packet::ipv4::checksum(&ip.to_immutable());
+                ip.set_checksum(cksum);
+            }
 
+            // Fragment 2: IP header (offset=1, no MF) + remaining 12 bytes of TCP
+            let mut frag2 = [0u8; 46]; // 14 eth + 20 ip + 12 tcp remainder
+            frag2[0..14].copy_from_slice(&buf[0..14]);
+            frag2[14..34].copy_from_slice(&buf[14..34]);
+            frag2[34..46].copy_from_slice(&buf[42..54]);
+            {
+                let mut ip = MutableIpv4Packet::new(&mut frag2[14..34]).unwrap();
+                ip.set_total_length(32); // 20 IP + 12 data
+                ip.set_flags(0x00); // No MF
+                ip.set_fragment_offset(1); // offset in 8-byte units
+                let cksum = pnet::packet::ipv4::checksum(&ip.to_immutable());
+                ip.set_checksum(cksum);
+            }
+
+            tx.send_to(&frag1, None);
+            tx.send_to(&frag2, None);
+        } else {
+            tx.send_to(&buf, None);
+        }
+
+        // Send decoy probes with spoofed source IPs
+        if !raw_opts.decoys.is_empty() {
+            let mut decoy_order: Vec<usize> = (0..raw_opts.decoys.len()).collect();
+            decoy_order.shuffle(&mut rng);
+            for idx in decoy_order {
+                let decoy_ip = raw_opts.decoys[idx];
+                let mut decoy_buf = buf;
+                {
+                    let mut ip = MutableIpv4Packet::new(&mut decoy_buf[14..34]).unwrap();
+                    ip.set_source(decoy_ip);
+                    let cksum = pnet::packet::ipv4::checksum(&ip.to_immutable());
+                    ip.set_checksum(cksum);
+                }
+                {
+                    let mut tcp = MutableTcpPacket::new(&mut decoy_buf[34..54]).unwrap();
+                    let cksum = pnet::packet::tcp::ipv4_checksum(
+                        &tcp.to_immutable(),
+                        &decoy_ip,
+                        &target_v4,
+                    );
+                    tcp.set_checksum(cksum);
+                }
+                tx.send_to(&decoy_buf, None);
+            }
+        }
+
+        let delay = timing.jittered_delay();
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
@@ -362,15 +465,25 @@ fn syn_scan_bpf(
                 let dst_port = tcp.get_destination();
                 if let Some(&target_port) = port_map.get(&dst_port) {
                     let flags = tcp.get_flags();
-                    let state = if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
-                        if verbose {
-                            eprintln!("  [+] {target_v4}:{target_port} - open (SYN-ACK)");
+                    let state = if scan_type == ScanType::Syn {
+                        // SYN scan: SYN-ACK = open, RST = closed
+                        if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
+                            if verbose {
+                                eprintln!("  [+] {target_v4}:{target_port} - open (SYN-ACK)");
+                            }
+                            PortState::Open
+                        } else if flags & TcpFlags::RST != 0 {
+                            PortState::Closed
+                        } else {
+                            continue;
                         }
-                        PortState::Open
-                    } else if flags & TcpFlags::RST != 0 {
-                        PortState::Closed
                     } else {
-                        continue;
+                        // FIN/NULL/Xmas: RST = closed, any other response is unexpected
+                        if flags & TcpFlags::RST != 0 {
+                            PortState::Closed
+                        } else {
+                            continue;
+                        }
                     };
 
                     results_map.insert(target_port, state);
@@ -386,12 +499,20 @@ fn syn_scan_bpf(
         }
     }
 
+    // For FIN/NULL/Xmas: no response = open|filtered (report as Open)
+    // For SYN: no response = filtered
+    let default_state = if scan_type == ScanType::Syn {
+        PortState::Filtered
+    } else {
+        PortState::Open
+    };
+
     let mut results: Vec<PortResult> = ports
         .iter()
         .map(|&port| PortResult {
             port,
             protocol: Protocol::Tcp,
-            state: *results_map.get(&port).unwrap_or(&PortState::Filtered),
+            state: *results_map.get(&port).unwrap_or(&default_state),
             service: None,
         })
         .collect();
@@ -409,11 +530,13 @@ async fn connect_scan(
 ) -> Vec<PortResult> {
     let semaphore = Arc::new(Semaphore::new(timing.max_parallel));
     let timeout = Duration::from_millis(timing.timeout_ms);
-    let delay = Duration::from_millis(timing.delay_ms);
+
+    let mut shuffled_ports: Vec<u16> = ports.to_vec();
+    shuffled_ports.shuffle(&mut rand::thread_rng());
 
     let mut handles = Vec::new();
 
-    for &port in ports {
+    for &port in &shuffled_ports {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
 
         handles.push(tokio::spawn(async move {
@@ -427,6 +550,7 @@ async fn connect_scan(
             }
         }));
 
+        let delay = timing.jittered_delay();
         if !delay.is_zero() {
             sleep(delay).await;
         }
@@ -471,11 +595,13 @@ async fn udp_scan(
 ) -> Vec<PortResult> {
     let semaphore = Arc::new(Semaphore::new(timing.max_parallel));
     let timeout = Duration::from_millis(timing.timeout_ms);
-    let delay = Duration::from_millis(timing.delay_ms);
+
+    let mut shuffled_ports: Vec<u16> = ports.to_vec();
+    shuffled_ports.shuffle(&mut rand::thread_rng());
 
     let mut handles = Vec::new();
 
-    for &port in ports {
+    for &port in &shuffled_ports {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
 
         handles.push(tokio::spawn(async move {
@@ -489,6 +615,7 @@ async fn udp_scan(
             }
         }));
 
+        let delay = timing.jittered_delay();
         if !delay.is_zero() {
             sleep(delay).await;
         }

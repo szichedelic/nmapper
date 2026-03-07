@@ -1,4 +1,5 @@
 use pnet::util::MacAddr;
+use rand::Rng;
 use serde::Serialize;
 use std::fmt;
 use std::net::IpAddr;
@@ -147,6 +148,15 @@ pub enum ScanType {
     Syn,
     Connect,
     Udp,
+    Fin,
+    Null,
+    Xmas,
+}
+
+impl ScanType {
+    pub fn is_raw(&self) -> bool {
+        matches!(self, ScanType::Syn | ScanType::Fin | ScanType::Null | ScanType::Xmas)
+    }
 }
 
 impl fmt::Display for ScanType {
@@ -155,6 +165,9 @@ impl fmt::Display for ScanType {
             ScanType::Syn => write!(f, "SYN"),
             ScanType::Connect => write!(f, "Connect"),
             ScanType::Udp => write!(f, "UDP"),
+            ScanType::Fin => write!(f, "FIN"),
+            ScanType::Null => write!(f, "NULL"),
+            ScanType::Xmas => write!(f, "Xmas"),
         }
     }
 }
@@ -181,6 +194,7 @@ pub struct TimingConfig {
     pub delay_ms: u64,
     pub timeout_ms: u64,
     pub label: &'static str,
+    pub jitter: bool,
 }
 
 impl TimingConfig {
@@ -191,37 +205,59 @@ impl TimingConfig {
                 delay_ms: 300,
                 timeout_ms: 5000,
                 label: "Paranoid",
+                jitter: true,
             },
             1 => TimingConfig {
                 max_parallel: 5,
                 delay_ms: 100,
                 timeout_ms: 3000,
                 label: "Sneaky",
+                jitter: true,
             },
             2 => TimingConfig {
                 max_parallel: 20,
                 delay_ms: 50,
                 timeout_ms: 2000,
                 label: "Polite",
+                jitter: true,
             },
             3 => TimingConfig {
                 max_parallel: 100,
                 delay_ms: 10,
                 timeout_ms: 1500,
                 label: "Normal",
+                jitter: false,
             },
             4 => TimingConfig {
                 max_parallel: 500,
                 delay_ms: 0,
                 timeout_ms: 1000,
                 label: "Aggressive",
+                jitter: false,
             },
             _ => TimingConfig {
                 max_parallel: 2000,
                 delay_ms: 0,
                 timeout_ms: 500,
                 label: "Insane",
+                jitter: false,
             },
+        }
+    }
+
+    /// Return a delay duration, applying jitter if enabled.
+    /// Jitter randomizes the delay between 50%-150% of the base delay.
+    pub fn jittered_delay(&self) -> std::time::Duration {
+        if self.delay_ms == 0 {
+            return std::time::Duration::ZERO;
+        }
+        if self.jitter {
+            let mut rng = rand::thread_rng();
+            let factor: f64 = rng.gen_range(0.5..1.5);
+            let jittered = (self.delay_ms as f64 * factor) as u64;
+            std::time::Duration::from_millis(jittered)
+        } else {
+            std::time::Duration::from_millis(self.delay_ms)
         }
     }
 }

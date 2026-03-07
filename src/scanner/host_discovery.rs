@@ -50,7 +50,6 @@ async fn icmp_sweep(
 ) -> Vec<DiscoveryResult> {
     let semaphore = Arc::new(Semaphore::new(timing.max_parallel));
     let timeout = Duration::from_millis(timing.timeout_ms.min(800));
-    let delay = Duration::from_millis(timing.delay_ms);
 
     let total = targets.len();
     let mut handles = Vec::with_capacity(total);
@@ -68,6 +67,7 @@ async fn icmp_sweep(
             result
         }));
 
+        let delay = timing.jittered_delay();
         if !delay.is_zero() {
             sleep(delay).await;
         }
@@ -412,7 +412,6 @@ async fn tcp_ping_sweep(
 ) -> Vec<DiscoveryResult> {
     let semaphore = Arc::new(Semaphore::new(timing.max_parallel));
     let timeout = Duration::from_millis(timing.timeout_ms.min(1000));
-    let delay = Duration::from_millis(timing.delay_ms);
 
     let mut handles = Vec::new();
 
@@ -425,6 +424,7 @@ async fn tcp_ping_sweep(
             result
         }));
 
+        let delay = timing.jittered_delay();
         if !delay.is_zero() {
             sleep(delay).await;
         }

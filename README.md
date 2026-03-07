@@ -5,7 +5,7 @@ A fast network mapper written in Rust for host discovery, port scanning, service
 ## Features
 
 - **Host Discovery**: ICMP ping sweep, ARP scanning (local subnet), TCP ping
-- **Port Scanning**: TCP SYN (half-open), TCP connect, UDP
+- **Port Scanning**: TCP SYN (half-open), TCP connect, UDP, FIN, NULL, Xmas
 - **Service Detection**: Banner grabbing with protocol-specific probes (HTTP, SSH, FTP, SMTP, DNS, MQTT, Redis, SMB, and more)
 - **OS Fingerprinting**: TCP/IP stack analysis (TTL, window size, DF bit, TCP options)
 - **TLS Inspection**: Certificate subject, issuer, validity, and SANs on HTTPS-like ports
@@ -18,12 +18,13 @@ A fast network mapper written in Rust for host discovery, port scanning, service
 - **Diff Scanning**: Compare current results against previous scans (SQLite-backed)
 - **Output**: Colored CLI table, JSON, self-contained HTML report with network diagram
 - **Rate Control**: Timing templates T0 (paranoid) through T5 (insane) with configurable concurrency
+- **Stealth Features**: Port/host randomization, delay jitter, TCP option randomization, decoy scanning, IP fragmentation, scan interleaving
 
 ## Requirements
 
 - Rust 1.70+
 - macOS or Linux
-- Root/sudo for SYN scanning, ARP discovery, OS fingerprinting, and passive mode
+- Root/sudo for raw scans (SYN/FIN/NULL/Xmas), ARP discovery, OS fingerprinting, and passive mode
 
 ## Build
 
@@ -62,6 +63,18 @@ sudo nmapper 10.0.0.1 -p 1-1024 --sV -o json --output-file results.json
 
 # Fast scan with aggressive timing
 sudo nmapper 192.168.1.0/24 -T5 -p 22,80,443
+
+# Stealth FIN scan
+sudo nmapper 192.168.1.0/24 -s fin -p 22,80,443
+
+# Xmas scan with decoys and fragmentation
+sudo nmapper 192.168.1.0/24 -s xmas --decoys 10.0.0.1,10.0.0.2 --fragment
+
+# Randomize TCP fingerprint and interleave across hosts
+sudo nmapper 192.168.1.0/24 --randomize-tcp --interleave
+
+# Paranoid stealth scan (auto jitter + randomization)
+sudo nmapper 10.0.0.0/24 -T0 -s fin -p 22,80,443
 ```
 
 ## Options
@@ -69,7 +82,7 @@ sudo nmapper 192.168.1.0/24 -T5 -p 22,80,443
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-p, --ports` | Port spec: `22,80,443`, `1-1024`, or `common` | `common` |
-| `-s, --scan-type` | `syn`, `connect`, or `udp` | `syn` |
+| `-s, --scan-type` | `syn`, `connect`, `udp`, `fin`, `null`, `xmas` | `syn` |
 | `-d, --discovery` | `icmp`, `arp`, `tcp`, or `skip` | `icmp` |
 | `-O, --os-detect` | Enable OS fingerprinting | off |
 | `--sV` | Enable service/version detection | off |
@@ -87,17 +100,21 @@ sudo nmapper 192.168.1.0/24 -T5 -p 22,80,443
 | `-v, --verbose` | Verbose output | off |
 | `--max-parallel` | Max concurrent probes (overrides timing) | - |
 | `--timeout` | Probe timeout in ms (overrides timing) | - |
+| `--randomize-tcp` | Randomize TCP window/TTL per probe | off |
+| `--decoys` | Decoy IPs mixed into raw scan probes | - |
+| `--fragment` | Fragment IP packets (raw scans only) | off |
+| `--interleave` | Interleave scanning across hosts | off |
 
 ## Timing Templates
 
-| Template | Label | Max Parallel | Probe Delay | Timeout |
-|----------|-------|-------------|-------------|---------|
-| T0 | Paranoid | 1 | 300ms | 5000ms |
-| T1 | Sneaky | 5 | 100ms | 3000ms |
-| T2 | Polite | 20 | 50ms | 2000ms |
-| T3 | Normal | 100 | 10ms | 1500ms |
-| T4 | Aggressive | 500 | 0ms | 1000ms |
-| T5 | Insane | 2000 | 0ms | 500ms |
+| Template | Label | Max Parallel | Probe Delay | Timeout | Jitter |
+|----------|-------|-------------|-------------|---------|--------|
+| T0 | Paranoid | 1 | 300ms | 5000ms | yes |
+| T1 | Sneaky | 5 | 100ms | 3000ms | yes |
+| T2 | Polite | 20 | 50ms | 2000ms | yes |
+| T3 | Normal | 100 | 10ms | 1500ms | no |
+| T4 | Aggressive | 500 | 0ms | 1000ms | no |
+| T5 | Insane | 2000 | 0ms | 500ms | no |
 
 ## Scan Types
 
@@ -106,6 +123,12 @@ sudo nmapper 192.168.1.0/24 -T5 -p 22,80,443
 **Connect scan** (no root required): Full TCP three-way handshake using async I/O. Fully parallel via tokio.
 
 **UDP scan**: Sends empty datagrams. Ports that respond are open; ICMP unreachable means closed; no response means open or filtered.
+
+**FIN scan** (requires root): Sends TCP FIN packets. Closed ports respond with RST; open/filtered ports send no response. Useful for evading SYN-based firewalls.
+
+**NULL scan** (requires root): Sends TCP packets with no flags set. Same response logic as FIN scan. Can bypass some stateless firewalls.
+
+**Xmas scan** (requires root): Sends TCP packets with FIN, PSH, and URG flags set. Same response logic as FIN scan. Named for the "lit up" flag pattern.
 
 ## How It Works
 

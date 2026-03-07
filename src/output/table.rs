@@ -181,7 +181,7 @@ fn print_host(host: &HostResult) {
 
     if !host.traceroute.is_empty() {
         println!();
-        println!("  Traceroute:");
+        println!("  {}", "Traceroute:".bold());
         for hop in &host.traceroute {
             let ip_str = hop
                 .ip
@@ -193,6 +193,69 @@ fn print_host(host: &HostResult) {
                 .map(|r| format!("{r:.1}ms"))
                 .unwrap_or_else(|| "*".to_string());
             println!("    {:>2}  {:<16} {:<30} {}", hop.ttl, ip_str, name, rtt);
+        }
+    }
+
+    if let Some(ref dns) = host.dns_enum {
+        println!();
+        println!("  {}", "DNS Enumeration:".bold());
+        if !dns.zone_transfer.is_empty() {
+            println!(
+                "    {}: {} record{}",
+                "Zone Transfer".cyan(),
+                dns.zone_transfer.len(),
+                if dns.zone_transfer.len() == 1 { "" } else { "s" }
+            );
+            for record in &dns.zone_transfer {
+                println!("      {}", record);
+            }
+        }
+        if !dns.subdomains.is_empty() {
+            println!(
+                "    {}: {} found",
+                "Subdomains".cyan(),
+                dns.subdomains.len()
+            );
+            for rec in &dns.subdomains {
+                println!("      {} {} {}", rec.name, rec.record_type, rec.value);
+            }
+        }
+        if !dns.reverse_dns.is_empty() {
+            println!(
+                "    {}: {} record{}",
+                "Reverse DNS".cyan(),
+                dns.reverse_dns.len(),
+                if dns.reverse_dns.len() == 1 { "" } else { "s" }
+            );
+            for rec in &dns.reverse_dns {
+                println!("      {} {} {}", rec.name, rec.record_type, rec.value);
+            }
+        }
+    }
+
+    if !host.http_paths.is_empty() {
+        for hp in &host.http_paths {
+            println!();
+            println!(
+                "  {} (port {}):",
+                "HTTP Paths".bold(),
+                hp.port.to_string().cyan()
+            );
+            for path in &hp.paths {
+                let status_colored = match path.status {
+                    200..=299 => path.status.to_string().green(),
+                    300..=399 => path.status.to_string().yellow(),
+                    _ => path.status.to_string().red(),
+                };
+                let detail = if let Some(ref redirect) = path.redirect {
+                    format!("-> {}", redirect)
+                } else if let Some(len) = path.content_length {
+                    format!("{}B", len)
+                } else {
+                    String::new()
+                };
+                println!("    {}  {:<16} {}", status_colored, path.path, detail.dimmed());
+            }
         }
     }
 

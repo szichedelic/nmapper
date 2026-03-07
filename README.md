@@ -1,21 +1,29 @@
 # nmapper
 
-A network mapper written in Rust for host discovery, port scanning, service detection, and OS fingerprinting. Built for learning network security concepts.
+A fast network mapper written in Rust for host discovery, port scanning, service detection, OS fingerprinting, and vulnerability assessment. Built for learning network security concepts.
 
 ## Features
 
 - **Host Discovery**: ICMP ping sweep, ARP scanning (local subnet), TCP ping
 - **Port Scanning**: TCP SYN (half-open), TCP connect, UDP
-- **Service Detection**: Banner grabbing with protocol-specific probes (HTTP, SSH, FTP, SMTP, and more)
+- **Service Detection**: Banner grabbing with protocol-specific probes (HTTP, SSH, FTP, SMTP, DNS, MQTT, Redis, SMB, and more)
 - **OS Fingerprinting**: TCP/IP stack analysis (TTL, window size, DF bit, TCP options)
-- **Output**: Colored CLI table and/or JSON export
+- **TLS Inspection**: Certificate subject, issuer, validity, and SANs on HTTPS-like ports
+- **MAC Vendor Lookup**: Identifies device manufacturers from MAC addresses via IEEE OUI database
+- **mDNS/Bonjour Discovery**: Finds devices advertising services via multicast DNS
+- **SSDP/UPnP Discovery**: Discovers media devices, smart TVs, and IoT devices
+- **Vulnerability Checks**: Tests for default credentials (SSH, HTTP, FTP, Telnet, SNMP) and exposed services (Redis, MongoDB without auth)
+- **Passive Mode**: Listen-only network discovery without sending any probes
+- **Watch Mode**: Continuous scanning with alerts on new hosts, opened/closed ports
+- **Diff Scanning**: Compare current results against previous scans (SQLite-backed)
+- **Output**: Colored CLI table, JSON, self-contained HTML report with network diagram
 - **Rate Control**: Timing templates T0 (paranoid) through T5 (insane) with configurable concurrency
 
 ## Requirements
 
 - Rust 1.70+
 - macOS or Linux
-- Root/sudo for SYN scanning, ARP discovery, and OS fingerprinting
+- Root/sudo for SYN scanning, ARP discovery, OS fingerprinting, and passive mode
 
 ## Build
 
@@ -34,8 +42,20 @@ sudo nmapper 192.168.1.0/24
 # TCP connect scan (no root required)
 nmapper 10.0.0.1 -s connect -p 22,80,443
 
-# Full scan with service detection and OS fingerprinting, output as table + JSON
-sudo nmapper 192.168.1.0/24 -p common --sV -O -o both
+# Full scan with service detection, OS fingerprinting, and device discovery
+sudo nmapper 192.168.1.0/24 -p common --sV -O --mdns --ssdp -o both
+
+# Scan with vulnerability checks and HTML report
+sudo nmapper 192.168.1.0/24 --sV --vuln-check -o html --output-file report.html
+
+# Compare against previous scan to detect changes
+sudo nmapper 192.168.1.0/24 --diff
+
+# Passive discovery — listen without sending any probes
+sudo nmapper 0.0.0.0 --passive --duration 60
+
+# Watch mode — continuously scan and alert on changes
+sudo nmapper 192.168.1.0/24 --watch --interval 300
 
 # Scan a port range with JSON file export
 sudo nmapper 10.0.0.1 -p 1-1024 --sV -o json --output-file results.json
@@ -53,8 +73,16 @@ sudo nmapper 192.168.1.0/24 -T5 -p 22,80,443
 | `-d, --discovery` | `icmp`, `arp`, `tcp`, or `skip` | `icmp` |
 | `-O, --os-detect` | Enable OS fingerprinting | off |
 | `--sV` | Enable service/version detection | off |
-| `-o, --output` | `table`, `json`, or `both` | `table` |
-| `--output-file` | Write JSON to file | - |
+| `--mdns` | Enable mDNS/Bonjour device discovery | off |
+| `--ssdp` | Enable SSDP/UPnP device discovery | off |
+| `--vuln-check` | Check for default credentials and exposed services | off |
+| `--diff` | Compare results against previous scan | off |
+| `--passive` | Passive discovery mode (listen only) | off |
+| `--duration` | Duration in seconds for passive discovery | `30` |
+| `--watch` | Continuous scanning with change alerts | off |
+| `--interval` | Seconds between watch mode scans | `300` |
+| `-o, --output` | `table`, `json`, `html`, or `both` | `table` |
+| `--output-file` | Write output to file (JSON or HTML based on extension) | - |
 | `-T, --timing` | Timing template 0-5 | `3` |
 | `-v, --verbose` | Verbose output | off |
 | `--max-parallel` | Max concurrent probes (overrides timing) | - |
@@ -81,10 +109,13 @@ sudo nmapper 192.168.1.0/24 -T5 -p 22,80,443
 
 ## How It Works
 
-1. **Discovery**: Identifies live hosts on the network using ICMP echo, ARP requests, or TCP connection attempts
+1. **Discovery**: Identifies live hosts using ICMP echo, ARP requests, or TCP connection attempts
 2. **Port scanning**: Probes specified ports on each live host to determine open/closed/filtered state
 3. **Service detection** (optional): Connects to open ports, grabs banners, and sends protocol-specific probes to identify running services and versions
-4. **OS fingerprinting** (optional): Analyzes TCP/IP response characteristics (initial TTL, window size, TCP options) to estimate the target's operating system
+4. **TLS inspection**: Extracts certificate details from HTTPS-like ports for service identification
+5. **OS fingerprinting** (optional): Analyzes TCP/IP response characteristics to estimate the target's operating system
+6. **Vulnerability checks** (optional): Tests for default credentials and dangerously exposed services
+7. **Output**: Results displayed as colored table, JSON, or self-contained HTML report with network diagram
 
 ## Disclaimer
 

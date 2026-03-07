@@ -19,12 +19,14 @@ A fast network mapper written in Rust for host discovery, port scanning, service
 - **Output**: Colored CLI table, JSON, self-contained HTML report with network diagram
 - **Rate Control**: Timing templates T0 (paranoid) through T5 (insane) with configurable concurrency
 - **Stealth Features**: Port/host randomization, delay jitter, TCP option randomization, decoy scanning, IP fragmentation, scan interleaving
+- **Network Intelligence**: Traceroute with hop mapping, DNS enumeration (zone transfer, subdomain brute, reverse sweep), HTTP path discovery
+- **Topology Visualization**: Layered network topology graph in HTML reports using traceroute data
 
 ## Requirements
 
 - Rust 1.70+
 - macOS or Linux
-- Root/sudo for raw scans (SYN/FIN/NULL/Xmas), ARP discovery, OS fingerprinting, and passive mode
+- Root/sudo for raw scans (SYN/FIN/NULL/Xmas), ARP discovery, OS fingerprinting, traceroute, and passive mode
 
 ## Build
 
@@ -75,6 +77,12 @@ sudo nmapper 192.168.1.0/24 --randomize-tcp --interleave
 
 # Paranoid stealth scan (auto jitter + randomization)
 sudo nmapper 10.0.0.0/24 -T0 -s fin -p 22,80,443
+
+# Full network intelligence scan with HTML topology report
+sudo nmapper 192.168.1.0/24 --traceroute --dns-enum --http-enum --sV -o html
+
+# Traceroute to a single host
+sudo nmapper 10.0.0.1 --traceroute -p 22,80,443
 ```
 
 ## Options
@@ -104,6 +112,9 @@ sudo nmapper 10.0.0.0/24 -T0 -s fin -p 22,80,443
 | `--decoys` | Decoy IPs mixed into raw scan probes | - |
 | `--fragment` | Fragment IP packets (raw scans only) | off |
 | `--interleave` | Interleave scanning across hosts | off |
+| `--traceroute` | Perform traceroute to each host | off |
+| `--dns-enum` | DNS enumeration on hosts with port 53 open | off |
+| `--http-enum` | HTTP path/directory discovery on web servers | off |
 
 ## Timing Templates
 
@@ -138,7 +149,8 @@ sudo nmapper 10.0.0.0/24 -T0 -s fin -p 22,80,443
 4. **TLS inspection**: Extracts certificate details from HTTPS-like ports for service identification
 5. **OS fingerprinting** (optional): Analyzes TCP/IP response characteristics to estimate the target's operating system
 6. **Vulnerability checks** (optional): Tests for default credentials and dangerously exposed services
-7. **Output**: Results displayed as colored table, JSON, or self-contained HTML report with network diagram
+7. **Network intelligence** (optional): Traceroute hop mapping, DNS enumeration, HTTP path discovery
+8. **Output**: Results displayed as colored table, JSON, or self-contained HTML report with layered network topology
 
 ## Disclaimer
 
